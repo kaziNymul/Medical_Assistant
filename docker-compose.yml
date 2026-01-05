@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  medical-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medical-assistant
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - DEBUG=true
+      - LOG_LEVEL=INFO
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - ENABLE_PII_MASKING=true
+      - LLM_PROVIDER=local
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - VECTOR_STORE_PATH=/app/data/vector_store
+      # Uncomment for Phase 2 (AWS Bedrock)
+      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      # - AWS_REGION=us-east-1
+      # - LLM_PROVIDER=bedrock
+    volumes:
+      # Persist vector store
+      - vector_store:/app/data/vector_store
+      # Mount sample data
+      - ./data/sample:/app/data/sample:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - medical-net
+
+volumes:
+  vector_store:
+    driver: local
+
+networks:
+  medical-net:
+    driver: bridge

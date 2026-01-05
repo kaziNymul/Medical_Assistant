@@ -1,0 +1,130 @@
+version: '3.8'
+
+# Production Docker Compose for AI Clinical Documentation Assistant
+# Usage: docker-compose -f docker-compose.prod.yml up -d
+
+services:
+  # ===========================================
+  # HashiCorp Vault - Secrets Management
+  # ===========================================
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: medical-vault
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-prod-vault-token}
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - vault_data:/vault/data
+      - ./scripts/vault-init.sh:/vault/init.sh:ro
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - medical-net
+
+  # ===========================================
+  # Backend API - FastAPI + Bedrock + FAISS
+  # ===========================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: medical-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=production
+      - DEBUG=false
+      - LOG_LEVEL=INFO
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      # Vault Configuration
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=${VAULT_TOKEN:-prod-vault-token}
+      - VAULT_ENABLED=true
+      # LLM Configuration
+      - LLM_PROVIDER=bedrock
+      - BEDROCK_MODEL_ID=anthropic.claude-3-haiku-20240307-v1:0
+      - BEDROCK_EMBEDDING_MODEL=amazon.titan-embed-text-v2:0
+      - AWS_REGION=us-east-1
+      # Security
+      - ENABLE_PII_MASKING=true
+      - CORS_ORIGINS=http://localhost:3000,http://frontend:3000
+    volumes:
+      # Persist data
+      - ./data/vector_store:/app/data/vector_store:ro
+      - ./data/processed:/app/data/processed:ro
+      - ./data/pii:/app/data/pii
+      - ./logs:/app/logs
+    depends_on:
+      vault:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - medical-net
+
+  # ===========================================
+  # Frontend - React + Vite (Production Build)
+  # ===========================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    container_name: medical-frontend
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_API_URL=http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - medical-net
+
+  # ===========================================
+  # Nginx Reverse Proxy (Optional - for HTTPS)
+  # ===========================================
+  nginx:
+    image: nginx:alpine
+    container_name: medical-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+    networks:
+      - medical-net
+    profiles:
+      - with-proxy
+
+volumes:
+  vault_data:
+    driver: local
+
+networks:
+  medical-net:
+    driver: bridge
