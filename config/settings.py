@@ -52,8 +52,13 @@ class Settings(BaseSettings):
     # Databricks (Phase 3) - fetched from Vault
     databricks_host: str | None = None
     databricks_token: str | None = None
-    databricks_catalog: str = "healthcare_ai"
-    databricks_schema: str = "clinical_docs"
+    databricks_catalog: str = "medical_ai"
+    databricks_schema: str = "clinical_data"
+    
+    # Local LLM Extraction (FLAN-T5)
+    extraction_model: str = "google/flan-t5-base"
+    extraction_device: str = "cpu"
+    extraction_max_length: int = 512
     
     # HashiCorp Vault
     vault_addr: str = "http://127.0.0.1:8200"

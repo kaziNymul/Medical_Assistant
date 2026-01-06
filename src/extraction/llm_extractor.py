@@ -134,11 +134,37 @@ class LocalLLMExtractor:
     """
     
     # Shorter, focused prompt for T5 (better with concise prompts)
-    EXTRACTION_PROMPT = """Extract clinical data as JSON:
+    EXTRACTION_PROMPT = """Extract clinical data from this text. Return JSON format only.
 
-{document_text}
+Text: {document_text}
 
-JSON output with: patient_name, date_of_birth, gender, age, mrn, phone, email, diagnoses (list), medications (list), allergies (list), lab_results (list), vital_signs, visit_date, chief_complaint, assessment, plan, provider_name, facility_name. Use null if not found."""
+Extract these fields as JSON:
+- patient_name: patient's full name
+- age: patient's age
+- gender: male/female
+- diagnoses: list of diagnosis names
+- medications: list of medication names with doses
+- allergies: list of allergies
+- vital_signs: blood pressure, heart rate, temperature
+- chief_complaint: main reason for visit
+- assessment: doctor's assessment
+- plan: treatment plan
+
+Return only valid JSON, nothing else."""
+
+    # Individual field extraction prompts (more reliable for T5)
+    FIELD_PROMPTS = {
+        "patient_name": "Extract the patient's name from this text. Return only the name, nothing else: {text}",
+        "age": "Extract the patient's age from this text. Return only the number, nothing else: {text}",
+        "gender": "Extract the patient's gender from this text. Return only 'male' or 'female', nothing else: {text}",
+        "diagnoses": "List all medical diagnoses mentioned in this text, separated by commas: {text}",
+        "medications": "List all medications mentioned in this text with doses if available, separated by commas: {text}",
+        "allergies": "List all allergies mentioned in this text, separated by commas. If none, return 'none': {text}",
+        "vital_signs": "Extract vital signs (blood pressure, heart rate, temperature, weight) from this text. Format: BP:value HR:value Temp:value Weight:value: {text}",
+        "chief_complaint": "What is the main complaint or reason for the visit in this text? Return one sentence: {text}",
+        "assessment": "What is the doctor's assessment or diagnosis summary in this text? Return one sentence: {text}",
+        "plan": "What is the treatment plan in this text? Return a brief summary: {text}",
+    }
 
     # Lock for thread-safe model loading
     _load_lock = threading.Lock()
@@ -262,35 +288,11 @@ JSON output with: patient_name, date_of_birth, gender, age, mrn, phone, email, d
             logger.info("Running clinical data extraction...")
             start_time = datetime.now()
             
-            # Tokenize input
-            inputs = self.tokenizer(
-                prompt, 
-                return_tensors="pt", 
-                max_length=512,
-                truncation=True,
-                padding=True
-            ).to(self.device)
-            
-            # Generate with optimized settings for CPU
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_length,
-                    num_beams=2,           # Reduced from 4 for speed
-                    early_stopping=True,
-                    do_sample=False,       # Deterministic for consistency
-                    temperature=1.0,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
-            
-            # Decode output
-            result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Use field-by-field extraction for better accuracy with T5
+            extraction = self._extract_fields_individually(document_text)
             
             extract_time = (datetime.now() - start_time).total_seconds()
             logger.info(f"Extraction completed in {extract_time:.1f}s")
-            
-            # Parse JSON from result
-            extraction = self._parse_extraction_result(result)
             
             # Add metadata
             extraction.source_file = source_file
@@ -308,6 +310,78 @@ JSON output with: patient_name, date_of_birth, gender, age, mrn, phone, email, d
                 extraction_timestamp=datetime.utcnow().isoformat(),
                 model_used=self.model_name
             )
+    
+    def _extract_single_field(self, text: str, field: str) -> str:
+        """Extract a single field using focused prompt."""
+        import torch
+        
+        prompt = self.FIELD_PROMPTS.get(field, f"Extract {field} from: {{text}}").format(text=text[:1500])
+        
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            max_length=512,
+            truncation=True,
+            padding=True
+        ).to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=100,
+                num_beams=2,
+                early_stopping=True,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        
+        result = self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        return result if result.lower() not in ['none', 'null', 'n/a', 'not found', 'unknown'] else None
+    
+    def _extract_fields_individually(self, document_text: str) -> ClinicalDataExtraction:
+        """Extract fields one by one for better accuracy."""
+        import torch
+        
+        extraction = ClinicalDataExtraction()
+        total_fields = 0
+        found_fields = 0
+        
+        # Extract each field
+        for field in self.FIELD_PROMPTS.keys():
+            try:
+                value = self._extract_single_field(document_text, field)
+                if value:
+                    found_fields += 1
+                    
+                    # Parse list fields
+                    if field in ['diagnoses', 'medications', 'allergies']:
+                        items = [item.strip() for item in value.split(',') if item.strip()]
+                        if field == 'diagnoses':
+                            extraction.diagnoses = [{"description": d, "code": None, "type": "primary" if i == 0 else "secondary"} for i, d in enumerate(items)]
+                        elif field == 'medications':
+                            extraction.medications = [{"name": m, "dose": None, "frequency": None, "route": "oral"} for m in items]
+                        elif field == 'allergies':
+                            extraction.allergies = [{"allergen": a, "reaction": None, "severity": "unknown"} for a in items]
+                    elif field == 'vital_signs':
+                        # Parse vital signs
+                        vitals = {}
+                        for v in value.replace(':', ' ').split():
+                            if 'BP' in value.upper() or '/' in value:
+                                if '/' in value:
+                                    vitals['blood_pressure'] = value.split()[0] if '/' in value.split()[0] else value
+                        if vitals:
+                            extraction.vital_signs = vitals
+                    else:
+                        setattr(extraction, field, value)
+                total_fields += 1
+            except Exception as e:
+                logger.debug(f"Failed to extract {field}: {e}")
+                total_fields += 1
+        
+        # Calculate confidence
+        extraction.extraction_confidence = found_fields / total_fields if total_fields > 0 else 0.0
+        
+        return extraction
     
     def _parse_extraction_result(self, result: str) -> ClinicalDataExtraction:
         """Parse LLM output into structured extraction."""

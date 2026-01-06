@@ -40,13 +40,27 @@ class DatabricksClinicalSync:
         """Get Databricks SQL connection."""
         if self._connection is not None:
             return self._connection
+        
+        # Validate host
+        if not self.host:
+            raise ValueError("DATABRICKS_HOST not configured")
+        if not self.token:
+            raise ValueError("DATABRICKS_TOKEN not configured")
+            
+        # Clean host (remove https:// if present)
+        server_hostname = self.host
+        if server_hostname.startswith('https://'):
+            server_hostname = server_hostname[8:]
+        if server_hostname.startswith('http://'):
+            server_hostname = server_hostname[7:]
+        server_hostname = server_hostname.rstrip('/')
             
         try:
             from databricks import sql
             
             self._connection = sql.connect(
-                server_hostname=self.host,
-                http_path=os.getenv('DATABRICKS_HTTP_PATH', '/sql/1.0/warehouses/default'),
+                server_hostname=server_hostname,
+                http_path=os.getenv('DATABRICKS_HTTP_PATH', '/sql/1.0/warehouses/78042e5b1a2be3e6'),
                 access_token=self.token
             )
             
@@ -60,7 +74,27 @@ class DatabricksClinicalSync:
             raise
     
     def _ensure_tables_exist(self, cursor):
-        """Create tables if they don't exist."""
+        """Create catalog, schema and tables if they don't exist."""
+        
+        # First, create catalog if it doesn't exist (Unity Catalog)
+        try:
+            cursor.execute(f"CREATE CATALOG IF NOT EXISTS {self.catalog}")
+        except Exception as e:
+            # Catalog creation might fail if user doesn't have permission
+            # Try to use existing catalog
+            logger.warning(f"Could not create catalog {self.catalog}: {e}")
+            # Fall back to 'main' catalog if available
+            try:
+                cursor.execute("USE CATALOG main")
+                self.catalog = "main"
+            except:
+                pass
+        
+        # Create schema if it doesn't exist
+        try:
+            cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.schema}")
+        except Exception as e:
+            logger.warning(f"Could not create schema: {e}")
         
         # Unmasked table (PHI - restricted access)
         cursor.execute(f"""
@@ -286,7 +320,27 @@ def get_databricks_sync() -> DatabricksClinicalSync:
     """Get singleton Databricks sync client."""
     global _sync_client
     if _sync_client is None:
-        _sync_client = DatabricksClinicalSync()
+        # Try to load from Vault first
+        try:
+            from src.utils.vault import get_vault_client
+            vault = get_vault_client()
+            if vault.is_connected:
+                secrets = vault.get_secrets()
+                host = secrets.get('DATABRICKS_HOST') or os.getenv('DATABRICKS_HOST')
+                token = secrets.get('DATABRICKS_TOKEN') or os.getenv('DATABRICKS_TOKEN')
+            else:
+                host = os.getenv('DATABRICKS_HOST')
+                token = os.getenv('DATABRICKS_TOKEN')
+        except Exception:
+            host = os.getenv('DATABRICKS_HOST')
+            token = os.getenv('DATABRICKS_TOKEN')
+        
+        _sync_client = DatabricksClinicalSync(
+            host=host,
+            token=token,
+            catalog=os.getenv('DATABRICKS_CATALOG', 'medical_ai'),
+            schema=os.getenv('DATABRICKS_SCHEMA', 'clinical_data')
+        )
     return _sync_client
 
 

@@ -903,6 +903,288 @@ async def sync_to_databricks(dry_run: bool = False):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@databricks_router.get("/extractions")
+async def get_databricks_extractions(
+    masked: bool = True,
+    limit: int = 50,
+    patient_name: Optional[str] = None
+):
+    """
+    Query clinical extractions from Databricks.
+    
+    Args:
+        masked: If True, query masked table (safe). If False, query unmasked (PHI).
+        limit: Maximum records to return
+        patient_name: Filter by patient name (optional)
+    """
+    try:
+        from src.utils.databricks_sync import get_databricks_sync
+        from databricks import sql
+        
+        sync = get_databricks_sync()
+        
+        # Get connection
+        host = sync.host
+        if host and host.startswith('https://'):
+            host = host[8:]
+        if host:
+            host = host.rstrip('/')
+        
+        conn = sql.connect(
+            server_hostname=host,
+            http_path='/sql/1.0/warehouses/78042e5b1a2be3e6',
+            access_token=sync.token
+        )
+        cursor = conn.cursor()
+        
+        table = f"{sync.catalog}.{sync.schema}.clinical_extractions_{'masked' if masked else 'unmasked'}"
+        
+        query = f"SELECT * FROM {table}"
+        if patient_name:
+            name_col = "patient_name_masked" if masked else "patient_name"
+            query += f" WHERE {name_col} LIKE '%{patient_name}%'"
+        query += f" ORDER BY created_at DESC LIMIT {limit}"
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        
+        cursor.close()
+        conn.close()
+        
+        results = [dict(zip(columns, row)) for row in rows]
+        
+        return {
+            "success": True,
+            "table": table,
+            "masked": masked,
+            "total": len(results),
+            "extractions": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to query Databricks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@databricks_router.get("/patients")
+async def get_patients(
+    include_pii: bool = False,
+    diagnosis: Optional[str] = None,
+    admission_type: Optional[str] = None,
+    patient_name: Optional[str] = None,
+    limit: int = 50
+):
+    """
+    Query patient records from Databricks Unity Catalog.
+    
+    Architecture:
+    - clinical_records_masked: 55,500 records (safe, no PII)
+    - pii_lookup: 55,500 records (PHI - clinicians only)
+    - clinical_records_full: Joined view for clinicians
+    
+    Args:
+        include_pii: If True, use joined view (clinician access). If False, masked only.
+        diagnosis: Filter by diagnosis (Diabetes, Cancer, Obesity, etc.)
+        admission_type: Filter by admission type (Emergency, Elective, Urgent)
+        patient_name: Filter by patient name (only works if include_pii=True)
+        limit: Maximum records to return
+    """
+    try:
+        import hvac
+        from databricks import sql as databricks_sql
+        
+        # Get credentials from Vault
+        vault_client = hvac.Client(
+            url=os.getenv("VAULT_ADDR", "http://127.0.0.1:8200"),
+            token=os.getenv("VAULT_TOKEN", "dev-token-medical")
+        )
+        secret = vault_client.secrets.kv.v2.read_secret_version(
+            path="medical-assistant",
+            mount_point="secret",
+            raise_on_deleted_version=False
+        )
+        vault_data = secret["data"]["data"]
+        
+        host = vault_data["DATABRICKS_HOST"].replace("https://", "").replace("http://", "")
+        token = vault_data["DATABRICKS_TOKEN"]
+        
+        conn = databricks_sql.connect(
+            server_hostname=host,
+            http_path='/sql/1.0/warehouses/78042e5b1a2be3e6',
+            access_token=token
+        )
+        cursor = conn.cursor()
+        cursor.execute("USE CATALOG medical_ai")
+        cursor.execute("USE SCHEMA clinical_data")
+        
+        # Choose table based on access level
+        if include_pii:
+            table = "clinical_records_full"
+            select_cols = """
+                record_id, patient_name, doctor_name, hospital_name, insurance_provider,
+                diagnosis, medication, admission_type, age, gender, blood_type,
+                date_of_admission, discharge_date, test_results
+            """
+        else:
+            table = "clinical_records_masked"
+            select_cols = """
+                record_id, diagnosis, medication, admission_type, age, gender, blood_type,
+                date_of_admission, discharge_date, billing_amount, room_number, test_results
+            """
+        
+        # Build query with filters
+        conditions = []
+        if diagnosis:
+            conditions.append(f"diagnosis = '{diagnosis}'")
+        if admission_type:
+            conditions.append(f"admission_type = '{admission_type}'")
+        if patient_name and include_pii:
+            conditions.append(f"LOWER(patient_name) LIKE LOWER('%{patient_name}%')")
+        
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        
+        query = f"""
+            SELECT {select_cols}
+            FROM {table}
+            WHERE {where_clause}
+            ORDER BY record_id
+            LIMIT {limit}
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        
+        # Get total count
+        count_query = f"SELECT COUNT(*) FROM {table} WHERE {where_clause}"
+        cursor.execute(count_query)
+        total_matching = cursor.fetchone()[0]
+        
+        cursor.close()
+        conn.close()
+        
+        results = [dict(zip(columns, row)) for row in rows]
+        
+        return {
+            "success": True,
+            "table": f"medical_ai.clinical_data.{table}",
+            "include_pii": include_pii,
+            "total_matching": total_matching,
+            "returned": len(results),
+            "filters": {
+                "diagnosis": diagnosis,
+                "admission_type": admission_type,
+                "patient_name": patient_name if include_pii else None
+            },
+            "patients": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to query patients: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@databricks_router.get("/stats")
+async def get_databricks_stats():
+    """
+    Get statistics about the clinical data in Databricks.
+    """
+    try:
+        import hvac
+        from databricks import sql as databricks_sql
+        
+        # Get credentials from Vault
+        vault_client = hvac.Client(
+            url=os.getenv("VAULT_ADDR", "http://127.0.0.1:8200"),
+            token=os.getenv("VAULT_TOKEN", "dev-token-medical")
+        )
+        secret = vault_client.secrets.kv.v2.read_secret_version(
+            path="medical-assistant",
+            mount_point="secret",
+            raise_on_deleted_version=False
+        )
+        vault_data = secret["data"]["data"]
+        
+        host = vault_data["DATABRICKS_HOST"].replace("https://", "").replace("http://", "")
+        token = vault_data["DATABRICKS_TOKEN"]
+        
+        conn = databricks_sql.connect(
+            server_hostname=host,
+            http_path='/sql/1.0/warehouses/78042e5b1a2be3e6',
+            access_token=token
+        )
+        cursor = conn.cursor()
+        cursor.execute("USE CATALOG medical_ai")
+        cursor.execute("USE SCHEMA clinical_data")
+        
+        stats = {}
+        
+        # Record counts
+        cursor.execute("SELECT COUNT(*) FROM clinical_records_masked")
+        stats["total_masked_records"] = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM pii_lookup")
+        stats["total_pii_records"] = cursor.fetchone()[0]
+        
+        # Diagnosis breakdown
+        cursor.execute("""
+            SELECT diagnosis, COUNT(*) as count 
+            FROM clinical_records_masked 
+            GROUP BY diagnosis 
+            ORDER BY count DESC
+        """)
+        stats["diagnosis_counts"] = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        # Admission type breakdown
+        cursor.execute("""
+            SELECT admission_type, COUNT(*) as count 
+            FROM clinical_records_masked 
+            GROUP BY admission_type 
+            ORDER BY count DESC
+        """)
+        stats["admission_type_counts"] = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        # Gender breakdown
+        cursor.execute("""
+            SELECT gender, COUNT(*) as count 
+            FROM clinical_records_masked 
+            GROUP BY gender
+        """)
+        stats["gender_counts"] = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        # Age stats
+        cursor.execute("""
+            SELECT MIN(age), MAX(age), AVG(age) 
+            FROM clinical_records_masked
+        """)
+        row = cursor.fetchone()
+        stats["age_stats"] = {
+            "min": row[0],
+            "max": row[1],
+            "average": round(float(row[2]), 1) if row[2] else None
+        }
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "success": True,
+            "catalog": "medical_ai",
+            "schema": "clinical_data",
+            "tables": {
+                "clinical_records_masked": "Safe - No PII (analysts)",
+                "pii_lookup": "PHI - Clinicians only",
+                "clinical_records_full": "Joined view for clinicians"
+            },
+            "statistics": stats
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ====================
 # CrewAI Routes
 # ====================
